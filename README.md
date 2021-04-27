@@ -125,3 +125,21 @@ If  some  of  these  requirements  are  not  satisfied then the measurement
 results  will  be  inadequate  or  fail completely. In general, for testing
 bandwidth  where  QoS is implemented, always test with traffic that matches
 the QoS class to be tested.
+
+## Difference from native ping
+
+Possible difference in reported time can be caused by timers used by ping and bwping. 
+ - ping may use some coarser timer (for example, gettimeofday() instead of clock_gettime() 
+   or different timer for clock_gettime().
+ - ping may use sendto()/recvfrom() calls while bwping uses more efficient 
+   sendmmsg()/recvmmsg() calls (if they are available), 
+   this can have an impact due to the different speed of processing 
+   these calls within the kernel.
+ - bwping uses additional BPF-based kernel-level filtering (if available) 
+   to quickly filter ICMP packets which are not related to a particular bwping process. 
+   This can also have an impact if there is many ICMP traffic on this host. 
+   ping most likely does not have such a filter and therefore 
+   is forced to receive extra ICMP packets and throw away unrelated ones in user mode, 
+   which may be more costly.
+
+May be other reasons as well, i.e routing.
