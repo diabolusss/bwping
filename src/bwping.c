@@ -290,7 +290,7 @@ static void send_ping(bool ipv4_mode, int sock, const struct addrinfo *to_ai, si
 #endif /* ENABLE_MMSG && HAVE_SENDMMSG */
 
 static void process_ping4(const char *packet, ssize_t pkt_size, uint16_t ident, uint64_t *received_count,
-                          uint64_t *received_volume, uint64_t *min_rtt, uint64_t *max_rtt, uint64_t *average_rtt)
+                          uint64_t *received_volume, uint64_t *curr_rtt)
 {
     struct ip ip4;
 
@@ -319,19 +319,8 @@ static void process_ping4(const char *packet, ssize_t pkt_size, uint16_t ident, 
 
                             get_time(&now);
 
-                            int64_t rtt = ts_sub(&now, &pkt_time) / 1000;
-
-                            if (rtt >= 0) {
-                                if (*min_rtt > (uint64_t)rtt) {
-                                    *min_rtt = rtt;
-                                }
-                                if (*max_rtt < (uint64_t)rtt) {
-                                    *max_rtt = rtt;
-                                }
-                                if (*received_count > 0) {
-                                    *average_rtt = (*average_rtt * (*received_count - 1) + rtt) / *received_count;
-                                }
-                            } else {
+		            int64_t rtt = *curr_rtt = ts_sub(&now, &pkt_time) / 1000; 
+                            if (rtt < 0) {
                                 fprintf(stderr, "%s: packet has an invalid timestamp\n", prog_name);
                             }
                         }
@@ -388,7 +377,7 @@ static void process_ping6(const char *packet, ssize_t pkt_size, uint16_t ident, 
 #if defined(ENABLE_MMSG) && defined(HAVE_RECVMMSG)
 
 static bool recvmmsg_ping(bool ipv4_mode, int sock, uint16_t ident, uint64_t *received_count, uint64_t *received_volume,
-                          uint64_t *min_rtt, uint64_t *max_rtt, uint64_t *average_rtt)
+                          uint64_t *curr_rtt, uint64_t *min_rtt, uint64_t *max_rtt, uint64_t *average_rtt)
 {
     static char packets[MAX_MMSG_VLEN][IP_MAXPACKET];
 
@@ -412,7 +401,7 @@ static bool recvmmsg_ping(bool ipv4_mode, int sock, uint16_t ident, uint64_t *re
     } else if (res > 0) {
         if (ipv4_mode) {
             for (int i = 0; i < res; i++) {
-                process_ping4(packets[i], msg[i].msg_len, ident, received_count, received_volume, min_rtt, max_rtt, average_rtt);
+                process_ping4(packets[i], msg[i].msg_len, ident, received_count, received_volume, curr_rtt);
             }
         } else {
             for (int i = 0; i < res; i++) {
@@ -429,7 +418,7 @@ static bool recvmmsg_ping(bool ipv4_mode, int sock, uint16_t ident, uint64_t *re
 #else /* ENABLE_MMSG && HAVE_RECVMMSG */
 
 static bool recv_ping(bool ipv4_mode, int sock, uint16_t ident, uint64_t *received_count, uint64_t *received_volume,
-                      uint64_t *min_rtt, uint64_t *max_rtt, uint64_t *average_rtt)
+                      uint64_t *curr_rtt, uint64_t *min_rtt, uint64_t *max_rtt, uint64_t *average_rtt)
 {
     static char packet[IP_MAXPACKET];
 
@@ -444,7 +433,7 @@ static bool recv_ping(bool ipv4_mode, int sock, uint16_t ident, uint64_t *receiv
         return false;
     } else if (res > 0) {
         if (ipv4_mode) {
-            process_ping4(packet, res, ident, received_count, received_volume, min_rtt, max_rtt, average_rtt);
+            process_ping4(packet, res, ident, received_count, received_volume, curr_rtt);
         } else {
             process_ping6(packet, res, ident, received_count, received_volume, min_rtt, max_rtt, average_rtt);
         }
@@ -479,6 +468,45 @@ static bool resolve_name(bool ipv4_mode, const char *name, struct addrinfo **add
         return true;
     }
 }
+
+/**
+ * Simple Kalman filter
+ *
+ *  TIME UPDATE
+ *   x^-_k = x^-_{k-1}
+ *   P^-_k = P_{k-1} + Q
+ *  MEASUREMENT UPDATE
+ *   K_k = P^-_k/(P^-_k + R)
+ *   x_k = x^-_k + K_k*(measurement - x^-_k)
+ *   P_k = P^-_k*(1 - K_k)
+ *
+ *  @arg z - measured value (uint16_t should be enough)
+ *  @arg x_est_last - previous estimasion value
+ *  @arg P_last - previous prediction estimate
+ *              is updated with new estimation
+ * 
+ * @return X_est - new estimation
+ */
+#define Q 0.022f // process noise (take some fixed value)
+#define R 0.697f // measure noise
+float kalman(uint16_t z, float x_est_last, float* P_last){
+    float* P = P_last;
+    float K;
+    float X_est;
+       
+    //TIME UPDATE
+    *(float*)P += Q;
+    
+    //MEASUREMENT UPDATE
+    K = *(float*)P * (1.0/(*(float*)P + R));
+    X_est = x_est_last + K * (z - x_est_last); 
+    *(float*)P *= (1- K);
+    
+    P_last = P;
+    
+    return X_est;
+}
+//#endif /* KALMAN */
 
 int main(int argc, char *argv[])
 {
@@ -686,7 +714,7 @@ int main(int argc, char *argv[])
                 uint16_t ident = getpid() & 0xFFFF;
 
 #if defined(ENABLE_BPF) && defined(HAVE_LINUX_FILTER_H) && defined(SO_ATTACH_FILTER)
-                struct sock_filter filter4[] = {
+		struct sock_filter filter4[] = {
                     /* (00) */ {0x30, 0, 0, 0x00000009},     /* ldb  [9]                         - IP Protocol */
                     /* (01) */ {0x15, 0, 8, IPPROTO_ICMP},   /* jeq  $IPPROTO_ICMP   jt 2  jf 10 - IP Protocol is ICMP */
                     /* (02) */ {0x28, 0, 0, 0x00000006},     /* ldh  [6]                         - IP Fragment Offset */
@@ -743,6 +771,7 @@ int main(int argc, char *argv[])
                          interval_error     = 0;
                 uint64_t min_rtt            = UINT64_MAX,
                          max_rtt            = 0,
+			 curr_rtt	    = 0,
                          average_rtt        = 0,
                          transmitted_count  = 0,
                          received_count     = 0,
@@ -751,8 +780,11 @@ int main(int argc, char *argv[])
                          total_count        = volume % pkt_size == 0 ? volume / pkt_size :
                                                                        volume / pkt_size + 1,
                          pkt_burst_error    = 0;
-
-                struct timespec start, end, report;
+    			// KALMAN FILTER variables
+    			float P; //= 0.5;
+    			float rtt_est; //= 0;
+                
+		struct timespec start, end, report;
 
                 get_time(&start);
                 get_time(&end);
@@ -794,11 +826,36 @@ int main(int argc, char *argv[])
                             fprintf(stderr, "%s: select() failed: %s\n", prog_name, strerror(errno));
                         } else if (n > 0) {
 #if defined(ENABLE_MMSG) && defined(HAVE_RECVMMSG)
-                            while (recvmmsg_ping(ipv4_mode, sock, ident, &received_count, &received_volume, &min_rtt, &max_rtt, &average_rtt)) {
+                            while (recvmmsg_ping(ipv4_mode, sock, ident, &received_count, &received_volume, &curr_rtt, &min_rtt, &max_rtt, &average_rtt)) {
 #else
-                            while (recv_ping(ipv4_mode, sock, ident, &received_count, &received_volume, &min_rtt, &max_rtt, &average_rtt)) {
+                            while (recv_ping(ipv4_mode, sock, ident, &received_count, &received_volume, &curr_rtt)) {
 #endif
-                                if (received_count >= transmitted_count) {
+                                if (curr_rtt > 0) {
+                                  if (min_rtt > curr_rtt) {
+                                    min_rtt = curr_rtt;
+                                  }
+                                  if (max_rtt < curr_rtt) {
+                                    max_rtt = curr_rtt;
+                                  }
+                                  if (received_count > 0) {
+                                    //converges to initial min rtt value. 
+				    average_rtt = (average_rtt * (received_count - 1) + curr_rtt) / received_count;
+                                    
+				    //take avg of previous + current 
+				    //average_rtt = (average_rtt + curr_rtt) / 2;
+
+				    //use Kalman filter instead to filter random spikes
+				    rtt_est = kalman(curr_rtt, rtt_est, &P);
+                                  }
+                                }
+				//if not set yet assume first packet received 
+				if(rtt_est == 0) {
+				    //init Kalman variables
+               			    P = 0.005f;
+               			    rtt_est = curr_rtt;
+				}
+
+				if (received_count >= transmitted_count) {
                                     break;
                                 }
                             }
@@ -829,23 +886,22 @@ int main(int argc, char *argv[])
                     }
 
                     get_time(&end);
-
                     if (reporting_period > 0 && end.tv_sec - report.tv_sec >= reporting_period) {
-                        printf("Periodic: pkts sent/rcvd: %" PRIu64 "/%" PRIu64 ", volume sent/rcvd: %" PRIu64 "/%" PRIu64 " bytes, time: %ld sec,"
-                               " speed: %" PRIu64 " kbps, rtt min/max/average: %" PRIu64 "/%" PRIu64 "/%" PRIu64 " ms\n",
+                        printf("Periodic: pkts tx/rx: %" PRIu64 "/%" PRIu64 ", vol tx/rx: %" PRIu64 "/%" PRIu64 " bytes, time: %ld sec,"
+                               " speed: %" PRIu64 " kbps, rtt curr/min/max/avg/est: %" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%.1f ms\n",
                                transmitted_count, received_count, transmitted_volume, received_volume, (long int)(end.tv_sec - start.tv_sec),
                                end.tv_sec - start.tv_sec > 0 ? received_volume / (end.tv_sec - start.tv_sec) * 8 / 1000 : received_volume * 8 / 1000,
-                               min_rtt == UINT64_MAX ? 0 : min_rtt, max_rtt, average_rtt);
+                               curr_rtt, min_rtt == UINT64_MAX ? 0 : min_rtt, max_rtt, average_rtt, rtt_est);
 
                         get_time(&report);
                     }
                 }
 
-                printf("Total: pkts sent/rcvd: %" PRIu64 "/%" PRIu64 ", volume sent/rcvd: %" PRIu64 "/%" PRIu64 " bytes, time: %ld sec,"
-                       " speed: %" PRIu64 " kbps, rtt min/max/average: %" PRIu64 "/%" PRIu64 "/%" PRIu64 " ms\n",
-                       transmitted_count, received_count, transmitted_volume, received_volume, (long int)(end.tv_sec - start.tv_sec),
-                       end.tv_sec - start.tv_sec > 0 ? received_volume / (end.tv_sec - start.tv_sec) * 8 / 1000 : received_volume * 8 / 1000,
-                       min_rtt == UINT64_MAX ? 0 : min_rtt, max_rtt, average_rtt);
+		printf("Total: pkts tx/rx: %" PRIu64 "/%" PRIu64 ", vol tx/rx: %" PRIu64 "/%" PRIu64 " bytes, time: %ld sec,"
+                               " speed: %" PRIu64 " kbps, rtt curr/min/max/avg/est: %" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%.1f ms\n",
+                               transmitted_count, received_count, transmitted_volume, received_volume, (long int)(end.tv_sec - start.tv_sec),
+                               end.tv_sec - start.tv_sec > 0 ? received_volume / (end.tv_sec - start.tv_sec) * 8 / 1000 : received_volume * 8 / 1000,
+                               curr_rtt, min_rtt == UINT64_MAX ? 0 : min_rtt, max_rtt, average_rtt, rtt_est);
 
                 freeaddrinfo(to_ai);
             } else {
