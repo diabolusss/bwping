@@ -224,31 +224,31 @@ static int64_t calibrate_timer(void)
 *  - jitter?
 **/
 static void process_rtt(struct rtt_t *rtts, uint64_t rx_count){
-	 if (rtts->curr < 0) { fprintf(stderr, "%s: packet has an invalid timestamp\n", prog_name); return;}
+	if (rtts->curr < 0) { fprintf(stderr, "%s: packet has an invalid timestamp\n", prog_name); return;}
 	 
-	  if (rtts->min > rtts->curr) {
-	    rtts->min = rtts->curr;
-	  }
-	  if (rtts->max < rtts->curr) {
-	    rtts->max = rtts->curr;
-	  }
-	  if (rx_count > 0) {
-	    //increasing sum with scaling
-	    //at some point converges to some rtt value (based on scaling and session duration)
-	    rtts->avg = (rtts->avg * (rx_count - 1) + rtts->curr*AVERAGE_RTT_SCALE) / rx_count;
-	    
-	    //take avg of previous + current 
-	    //average_rtt = (average_rtt + curr_rtt) / 2;
-
-	    //use Kalman filter for dinamic updates (to filter random spikes, ...)
-	    rtts->est = kalman(rtts->curr, rtts->est, &(rtts->P));
-	  }
-
-	//if not set yet assume first packet received 
+	//if not set yet - assume first packet received 
 	if(rtts->est == 0) {
 	    //init Kalman variables
 	    rtts->P = 0.015f;
 	    rtts->est = rtts->curr;
+	}
+	
+	if (rtts->min > rtts->curr) {
+	  rtts->min = rtts->curr;
+	}
+	if (rtts->max < rtts->curr) {
+	  rtts->max = rtts->curr;
+	}
+	if (rx_count > 0) {
+	  //increasing sum with scaling
+	  //at some point converges to some rtt value (based on scaling and session duration)
+	  rtts->avg = (rtts->avg * (rx_count - 1) + rtts->curr*AVERAGE_RTT_SCALE) / rx_count;
+
+	  //take avg of previous + current 
+	  //average_rtt = (average_rtt + curr_rtt) / 2;
+
+	  //use Kalman filter for dinamic updates (to filter random spikes, ...)
+	  rtts->est = kalman(rtts->curr, rtts->est, &(rtts->P));
 	}
 }
 
