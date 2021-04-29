@@ -2,6 +2,7 @@
 #include <config.h>
 #endif
 
+#include <signal.h>
 #include <sys/types.h>
 #include <sys/time.h>
 #include <sys/select.h>
@@ -54,12 +55,22 @@ struct rtt_t{
   	min,  //min per session
 	max,  //max per session
  	avg   //avg per session
- ;  
+  ;  
   float	   
   	P,
   	est  //estimated time by simplified Kalman filter - best for realtime observations
   ;
-} rtts = {0,UINT64_MAX,0,0,.0,.0};
+  
+  uint64_t 
+  	tx_count,
+  	rx_count,
+  	total_count,
+  	tx_vol,
+  	rx_vol
+  ;
+} rtts = {0,UINT64_MAX,0,0,.0,.0,0,0,0,0,0};
+
+struct timespec start, end;
 
 static const size_t   MAX_IPV4_HDR_SIZE  = 60;
 static const uint32_t CALIBRATION_CYCLES = 100;
@@ -560,6 +571,26 @@ static bool resolve_name(bool ipv4_mode, const char *name, struct addrinfo **add
     }
 }
 
+/*********************************
+****  Signal handlers  ***********
+**********************************/
+	static void exit_handler(void){
+		printf("\n----- statistics -----\n");
+		printf("time:  %ld sec\n",  (long int)(end.tv_sec - start.tv_sec));
+		printf("speed:  %" PRIu64 " kbps\n",  (end.tv_sec - start.tv_sec > 0 ? rtts.rx_vol / (end.tv_sec - start.tv_sec) * 8 / 1000 : rtts.rx_vol * 8 / 1000));
+		printf("transmitted:  %" PRIu64 " bytes, %" PRIu64 " pkts\n", rtts.tx_vol, rtts.tx_count);
+		printf("received:  %" PRIu64 " bytes, %" PRIu64 " pkts\n", rtts.rx_vol, rtts.rx_count);
+		printf("rtt curr/min/max/avg: %" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 " ms\n", rtts.curr, rtts.min == UINT64_MAX ? 0 : rtts.min, rtts.max, rtts.avg/AVERAGE_RTT_SCALE);
+	}
+
+	static void sigint_handler(__attribute__((unused)) int sig){
+		exit(0);
+	}
+
+	static void sigpipe_handler(__attribute__((unused)) int sig){
+		/* ignore signal here - we will handle it after write failed */
+	}
+
 int main(int argc, char *argv[])
 {
     prog_name = basename(argv[0]);
@@ -708,6 +739,31 @@ int main(int argc, char *argv[])
             exit(EX_OSERR);
         }
     }
+    
+    	//The SIGINT signal is sent to a process by its controlling terminal 
+	//when a user wishes to interrupt the process. This is typically initiated by pressing Ctrl-C, 
+	//but on some systems, the "delete" character or "break" key can be used.[5]
+	signal(SIGINT, sigint_handler);
+	
+	//The SIGTERM signal is sent to a process to request its termination. 
+	//Unlike the SIGKILL signal, it can be caught and interpreted or ignored by the process. 
+	//This allows the process to perform nice termination releasing resources and saving state if appropriate. SIGINT is nearly identical to SIGTERM.
+	signal(SIGTERM, sigint_handler);
+	
+	//The SIGHUP signal is sent to a process when its controlling terminal is closed. 
+	//It was originally designed to notify the process of a serial line drop (a hangup). 
+	//In modern systems, this signal usually means that the controlling pseudo or virtual terminal has been closed.
+	//Many daemons will reload their configuration files and reopen their logfiles 
+	//instead of exiting when receiving this signal.[4] nohup is a command to make a command ignore the signal.
+	signal(SIGHUP, sigint_handler);
+	
+	//SIGPIPE will be generated when a process writes to a pipe which has been closed by the reader; 
+	//by default, this causes the process to terminate, which is convenient when constructing shell pipelines.
+	//The SIGPIPE signal is sent to a process when it attempts to write to a pipe without a process connected to the other end.
+	signal(SIGPIPE, sigpipe_handler);
+	
+	//int atexit(void (*func)(void)) causes the specified function func to be called when the program terminates. 
+	atexit(exit_handler);
 
     if (setuid(getuid()) < 0) {
         fprintf(stderr, "%s: setuid(getuid()) failed: %s\n", prog_name, strerror(errno));
@@ -821,19 +877,14 @@ int main(int argc, char *argv[])
                 bool     finish             = false;
                 int64_t  current_interval   = interval,
                          interval_error     = 0;
-                uint64_t min_rtt            = UINT64_MAX,
-                         max_rtt            = 0,
-			 curr_rtt	    = 0,
-                         average_rtt        = 0,
-                         transmitted_count  = 0,
-                         received_count     = 0,
-                         transmitted_volume = 0,
-                         received_volume    = 0,
+                uint64_t 
                          total_count        = volume % pkt_size == 0 ? volume / pkt_size :
                                                                        volume / pkt_size + 1,
-                         pkt_burst_error    = 0;                
+                         pkt_burst_error    = 0;  
+                                       
+                rtts.total_count = total_count;
                 
-		struct timespec start, end, report;
+		struct timespec report;
 
                 get_time(&start);
                 get_time(&end);
@@ -844,15 +895,15 @@ int main(int argc, char *argv[])
 
                     get_time(&interval_start);
 
-                    uint64_t pkt_count = total_count - transmitted_count > pkt_burst / PKT_BURST_SCALE + pkt_burst_error / PKT_BURST_SCALE ?
+                    uint64_t pkt_count = total_count - rtts.tx_count > pkt_burst / PKT_BURST_SCALE + pkt_burst_error / PKT_BURST_SCALE ?
                                                                            pkt_burst / PKT_BURST_SCALE + pkt_burst_error / PKT_BURST_SCALE :
-                                                                           total_count - transmitted_count;
+                                                                           total_count - rtts.tx_count;
 
 #if defined(ENABLE_MMSG) && defined(HAVE_SENDMMSG)
-                    sendmmsg_ping(ipv4_mode, sock, to_ai, pkt_size, ident, pkt_count, &transmitted_count, &transmitted_volume);
+                    sendmmsg_ping(ipv4_mode, sock, to_ai, pkt_size, ident, pkt_count, &rtts.tx_count, &rtts.tx_vol);
 #else
                     for (uint64_t i = 0; i < pkt_count; i++) {
-                        send_ping(ipv4_mode, sock, to_ai, pkt_size, ident, i == 0, &transmitted_count, &transmitted_volume);
+                        send_ping(ipv4_mode, sock, to_ai, pkt_size, ident, i == 0, &rtts.tx_count, &rtts.tx_vol);
                     }
 #endif
 
@@ -875,11 +926,11 @@ int main(int argc, char *argv[])
                             fprintf(stderr, "%s: select() failed: %s\n", prog_name, strerror(errno));
                         } else if (n > 0) {
 #if defined(ENABLE_MMSG) && defined(HAVE_RECVMMSG)
-                            while (recvmmsg_ping(ipv4_mode, sock, ident, &received_count, &received_volume, &rtts)) {
+                            while (recvmmsg_ping(ipv4_mode, sock, ident, &rtts.rx_count, &rtts.rx_vol, &rtts)) {
 #else
-                            while (recv_ping(ipv4_mode, sock, ident, &received_count, &received_volume, &rtts)) {
+                            while (recv_ping(ipv4_mode, sock, ident, &rtts.rx_count, &rtts.rx_vol, &rtts)) {
 #endif
-				if (received_count >= transmitted_count) {
+				if (rtts.rx_count >= rtts.tx_count) {
                                     break;
                                 }
                             }
@@ -890,7 +941,8 @@ int main(int argc, char *argv[])
                         get_time(&now);
 
                         if (ts_sub(&now, &interval_start) >= current_interval) {
-                            if (transmitted_volume >= volume) {
+                            if (rtts.tx_vol >= volume) {
+                            	//todo# maybe we should wait a little to receive all packets back? 
                                 finish = true;
                             } else {
                                 interval_error += ts_sub(&now, &interval_start) - current_interval;
@@ -912,22 +964,16 @@ int main(int argc, char *argv[])
                     get_time(&end);
                     if (reporting_period > 0 && end.tv_sec - report.tv_sec >= reporting_period) {
 			printf("pkts tx/rx: %" PRIu64 "/%" PRIu64 ", vol tx/rx: %" PRIu64 "/%" PRIu64 " bytes, time: %ld sec,"
-                               " speed: %" PRIu64 " kbps, rtt curr/min/max/avg/est: %" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%.1f/%.1f ms\n",
-                               transmitted_count, received_count, transmitted_volume, received_volume, (long int)(end.tv_sec - start.tv_sec),
-                               end.tv_sec - start.tv_sec > 0 ? received_volume / (end.tv_sec - start.tv_sec) * 8 / 1000 : received_volume * 8 / 1000,
-                               rtts.curr, rtts.min == UINT64_MAX ? 0 : rtts.min, rtts.max, ((float)rtts.avg/AVERAGE_RTT_SCALE), rtts.est);
+                               " speed: %" PRIu64 " kbps, rtt curr/min/max/avg/est: %" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%.0f ms\n",
+                               rtts.tx_count, rtts.rx_count, rtts.tx_vol, rtts.rx_vol, (long int)(end.tv_sec - start.tv_sec),
+                               end.tv_sec - start.tv_sec > 0 ? rtts.rx_vol / (end.tv_sec - start.tv_sec) * 8 / 1000 : rtts.rx_vol * 8 / 1000,
+                               rtts.curr, rtts.min == UINT64_MAX ? 0 : rtts.min, rtts.max, (rtts.avg/AVERAGE_RTT_SCALE), rtts.est);
 
                         get_time(&report);
                     }
                 }
 
-		printf("Total: pkts tx/rx: %" PRIu64 "/%" PRIu64 ", vol tx/rx: %" PRIu64 "/%" PRIu64 " bytes, time: %ld sec,"
-                               " speed: %" PRIu64 " kbps, rtt curr/min/max/avg/est: %" PRIu64 "/%" PRIu64 "/%" PRIu64 "/%" PRIu64 " ms\n",
-                               transmitted_count, received_count, transmitted_volume, received_volume, (long int)(end.tv_sec - start.tv_sec),
-                               end.tv_sec - start.tv_sec > 0 ? received_volume / (end.tv_sec - start.tv_sec) * 8 / 1000 : received_volume * 8 / 1000,
-                               curr_rtt, min_rtt == UINT64_MAX ? 0 : min_rtt, max_rtt, average_rtt);
-
-                freeaddrinfo(to_ai);
+		freeaddrinfo(to_ai);
             } else {
                 exit_val = EX_NOHOST;
             }
